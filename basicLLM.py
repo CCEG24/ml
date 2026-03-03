@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import datasets
 
 manualDataset = False
+randomSeed = True
 
 if manualDataset:
     with open("trainingText.txt", "r", encoding="utf-8") as f:
@@ -194,7 +195,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--text-file", type=str, default="", help="Optional path to training text file")
 	parser.add_argument("--max-iters", type=int, default=1500, help="Training iterations")
 	parser.add_argument("--generate-tokens", type=int, default=250, help="Number of chars to generate")
-	parser.add_argument("--seed", type=int, default=42, help="Random seed")
+	parser.add_argument("--seed", type=int, default=random.randint(), help="Random seed")
 	parser.add_argument("--num-threads", type=int, default=7, help="PyTorch CPU threads to use")
 	return parser.parse_args()
 
