@@ -211,13 +211,12 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--text-file", type=str, default="", help="Optional path to training text file")
 	parser.add_argument("--max-iters", type=int, default=1500, help="Training iterations")
 	parser.add_argument("--generate-tokens", type=int, default=250, help="Number of chars to generate")
-	parser.add_argument("--seed", type=int, default=random.randint(), help="Random seed")
+	parser.add_argument("--seed", type=int, default=random.randint(0, 1000000), help="Random seed")
 	parser.add_argument("--prompt", type=str, default="", help="Optional prompt to start generation")
 	parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature (lower is less random)")
 	parser.add_argument("--top-k", type=int, default=0, help="Sample only from top-k tokens (0 disables)")
-	parser.add_argument("--seed", type=int, default=42, help="Random seed")
 	parser.add_argument("--num-threads", type=int, default=7, help="PyTorch CPU threads to use")
-	parser.add_argument("--num-rows", type=int, default=1, help="Number of dataset rows to concatenate")
+	parser.add_argument("--num-rows", type=int, default=1500, help="Number of dataset rows to concatenate")
 	return parser.parse_args()
 
 
