@@ -1,6 +1,7 @@
 import argparse
 import math
 import random
+from pathlib import Path
 from dataclasses import dataclass
 
 import torch
@@ -25,6 +26,35 @@ def load_hf_training_text(num_rows: int) -> str:
 def set_seed(seed: int) -> None:
 	random.seed(seed)
 	torch.manual_seed(seed)
+
+
+def save_checkpoint(
+	checkpoint_path: str,
+	model: nn.Module,
+	cfg: Config,
+	stoi: dict[str, int],
+	itos: dict[int, str],
+	seed: int,
+	device: str,
+) -> None:
+	payload = {
+		"model_state_dict": model.state_dict(),
+		"cfg": cfg.__dict__,
+		"stoi": stoi,
+		"itos": itos,
+		"seed": seed,
+	}
+	path = Path(checkpoint_path)
+	path.parent.mkdir(parents=True, exist_ok=True)
+	torch.save(payload, path)
+	print(f"Saved checkpoint to {path} (device={device})")
+
+
+def load_checkpoint(checkpoint_path: str, device: str):
+	path = Path(checkpoint_path)
+	if not path.exists():
+		raise FileNotFoundError(f"Checkpoint not found: {path}")
+	return torch.load(path, map_location=device)
 
 
 def build_vocab(text: str):
@@ -217,11 +247,16 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--top-k", type=int, default=0, help="Sample only from top-k tokens (0 disables)")
 	parser.add_argument("--num-threads", type=int, default=7, help="PyTorch CPU threads to use")
 	parser.add_argument("--num-rows", type=int, default=1500, help="Number of dataset rows to concatenate")
+	parser.add_argument("--checkpoint-path", type=str, default="checkpoints/basicllm.pt", help="Path to save/load checkpoint")
+	parser.add_argument("--load-checkpoint", action="store_true", help="Load model and tokenizer from checkpoint")
+	parser.add_argument("--skip-train", action="store_true", help="Skip training loop (use with --load-checkpoint)")
+	parser.add_argument("--save-checkpoint", action="store_true", help="Save checkpoint after training")
 	return parser.parse_args()
 
 
 def main() -> None:
 	args = parse_args()
+	device = "cuda" if torch.cuda.is_available() else "cpu"
 	cfg = Config(max_iters=args.max_iters, generate_tokens=args.generate_tokens, seed=args.seed)
 	if args.num_threads > 0:
 		torch.set_num_threads(args.num_threads)
@@ -229,33 +264,50 @@ def main() -> None:
 			torch.set_num_interop_threads(max(1, min(2, args.num_threads)))
 	set_seed(cfg.seed)
 
-	if args.text_file:
-		with open(args.text_file, "r", encoding="utf-8") as f:
-			text = f.read()
-	elif manualDataset:
-		with open("trainingText.txt", "r", encoding="utf-8") as f:
-			text = f.read()
+	if args.load_checkpoint:
+		checkpoint = load_checkpoint(args.checkpoint_path, device)
+		cfg = Config(**checkpoint["cfg"])
+		cfg.max_iters = args.max_iters
+		cfg.generate_tokens = args.generate_tokens
+		cfg.seed = args.seed
+		stoi = checkpoint["stoi"]
+		itos = {int(k): v for k, v in checkpoint["itos"].items()}
+		model = TinyGPT(vocab_size=len(stoi), cfg=cfg).to(device)
+		model.load_state_dict(checkpoint["model_state_dict"])
+		print(f"Loaded checkpoint from {args.checkpoint_path}")
+		if "seed" in checkpoint:
+			print(f"checkpoint_seed={checkpoint['seed']}")
+		data = None
+		train_data = None
+		val_data = None
 	else:
-		text = load_hf_training_text(args.num_rows)
+		if args.text_file:
+			with open(args.text_file, "r", encoding="utf-8") as f:
+				text = f.read()
+		elif manualDataset:
+			with open("trainingText.txt", "r", encoding="utf-8") as f:
+				text = f.read()
+		else:
+			text = load_hf_training_text(args.num_rows)
 
-	if len(text) < 20:
-		raise ValueError("Training text is too short. Provide at least 20 characters.")
+		if len(text) < 20:
+			raise ValueError("Training text is too short. Provide at least 20 characters.")
 
-	if len(text) < cfg.block_size + 2:
-		cfg.block_size = len(text) - 2
-		print(f"Adjusted block_size to {cfg.block_size} to match small dataset size.")
+		if len(text) < cfg.block_size + 2:
+			cfg.block_size = len(text) - 2
+			print(f"Adjusted block_size to {cfg.block_size} to match small dataset size.")
 
-	stoi, itos = build_vocab(text)
-	data = encode(text, stoi)
-	split_idx = int(0.9 * len(data))
-	train_data = data[:split_idx]
-	val_data = data[split_idx:]
-	if len(val_data) <= cfg.block_size + 1:
-		val_data = train_data
-		print("Validation split is too short for current block_size; using train split for validation estimates.")
+		stoi, itos = build_vocab(text)
+		data = encode(text, stoi)
+		split_idx = int(0.9 * len(data))
+		train_data = data[:split_idx]
+		val_data = data[split_idx:]
+		if len(val_data) <= cfg.block_size + 1:
+			val_data = train_data
+			print("Validation split is too short for current block_size; using train split for validation estimates.")
 
-	device = "cuda" if torch.cuda.is_available() else "cpu"
-	model = TinyGPT(vocab_size=len(stoi), cfg=cfg).to(device)
+		model = TinyGPT(vocab_size=len(stoi), cfg=cfg).to(device)
+
 	optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate)
 
 	total_params = sum(p.numel() for p in model.parameters())
@@ -264,16 +316,24 @@ def main() -> None:
 		f"threads={torch.get_num_threads()}"
 	)
 
-	for step in range(cfg.max_iters + 1):
-		if step % cfg.eval_interval == 0:
-			losses = estimate_loss(model, train_data, val_data, cfg, device)
-			print(f"step {step:4d} | train loss {losses['train']:.4f} | val loss {losses['val']:.4f}")
+	if not args.skip_train:
+		if train_data is None or val_data is None:
+			raise ValueError("Training requested but no dataset is available. Disable --load-checkpoint or remove --skip-train.")
+		for step in range(cfg.max_iters + 1):
+			if step % cfg.eval_interval == 0:
+				losses = estimate_loss(model, train_data, val_data, cfg, device)
+				print(f"step {step:4d} | train loss {losses['train']:.4f} | val loss {losses['val']:.4f}")
 
-		xb, yb = get_batch(train_data, cfg, device)
-		_, loss = model(xb, yb)
-		optimizer.zero_grad(set_to_none=True)
-		loss.backward()
-		optimizer.step()
+			xb, yb = get_batch(train_data, cfg, device)
+			_, loss = model(xb, yb)
+			optimizer.zero_grad(set_to_none=True)
+			loss.backward()
+			optimizer.step()
+		if args.save_checkpoint:
+			save_checkpoint(args.checkpoint_path, model, cfg, stoi, itos, args.seed, device)
+	else:
+		if not args.load_checkpoint:
+			raise ValueError("--skip-train requires --load-checkpoint so model weights are available.")
 
 	if args.prompt:
 		fallback_char = " " if " " in stoi else next(iter(stoi))
