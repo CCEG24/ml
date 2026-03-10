@@ -11,12 +11,16 @@ import datasets
 manualDataset = False
 randomSeed = True
 
-if manualDataset:
-    with open("trainingText.txt", "r", encoding="utf-8") as f:
-        DEFAULT_TRAINING_TEXT = f.read()
-else:
+def load_hf_training_text(num_rows: int) -> str:
 	dataset = datasets.load_dataset("openbmb/UltraInteract_sft", split="train")
-	DEFAULT_TRAINING_TEXT = dataset["instruction"][0] + "\n\n" + dataset["response"][500]
+	rows_to_use = max(1, min(num_rows, len(dataset)))
+	subset = dataset.select(range(rows_to_use))
+	parts = []
+	for row in subset:
+		instruction = str(row.get("instruction", ""))
+		response = str(row.get("response", ""))
+		parts.append(f"Instruction:\n{instruction}\n\nResponse:\n{response}")
+	return "\n\n".join(parts)
 
 def set_seed(seed: int) -> None:
 	random.seed(seed)
@@ -151,12 +155,24 @@ class TinyGPT(nn.Module):
 		return logits, loss
 
 	@torch.no_grad()
-	def generate(self, idx: torch.Tensor, max_new_tokens: int) -> torch.Tensor:
+	def generate(
+		self,
+		idx: torch.Tensor,
+		max_new_tokens: int,
+		temperature: float = 1.0,
+		top_k: int = 0,
+	) -> torch.Tensor:
 		self.eval()
 		for _ in range(max_new_tokens):
 			idx_cond = idx[:, -self.cfg.block_size :]
 			logits, _ = self(idx_cond)
 			logits = logits[:, -1, :]
+			logits = logits / max(temperature, 1e-6)
+			if top_k > 0:
+				top_k = min(top_k, logits.size(-1))
+				values, _ = torch.topk(logits, top_k)
+				min_values = values[:, [-1]]
+				logits = torch.where(logits < min_values, torch.full_like(logits, float("-inf")), logits)
 			probs = F.softmax(logits, dim=-1)
 			idx_next = torch.multinomial(probs, num_samples=1)
 			idx = torch.cat((idx, idx_next), dim=1)
@@ -196,7 +212,12 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--max-iters", type=int, default=1500, help="Training iterations")
 	parser.add_argument("--generate-tokens", type=int, default=250, help="Number of chars to generate")
 	parser.add_argument("--seed", type=int, default=random.randint(), help="Random seed")
+	parser.add_argument("--prompt", type=str, default="", help="Optional prompt to start generation")
+	parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature (lower is less random)")
+	parser.add_argument("--top-k", type=int, default=0, help="Sample only from top-k tokens (0 disables)")
+	parser.add_argument("--seed", type=int, default=42, help="Random seed")
 	parser.add_argument("--num-threads", type=int, default=7, help="PyTorch CPU threads to use")
+	parser.add_argument("--num-rows", type=int, default=1, help="Number of dataset rows to concatenate")
 	return parser.parse_args()
 
 
@@ -212,8 +233,11 @@ def main() -> None:
 	if args.text_file:
 		with open(args.text_file, "r", encoding="utf-8") as f:
 			text = f.read()
+	elif manualDataset:
+		with open("trainingText.txt", "r", encoding="utf-8") as f:
+			text = f.read()
 	else:
-		text = DEFAULT_TRAINING_TEXT
+		text = load_hf_training_text(args.num_rows)
 
 	if len(text) < 20:
 		raise ValueError("Training text is too short. Provide at least 20 characters.")
@@ -252,8 +276,19 @@ def main() -> None:
 		loss.backward()
 		optimizer.step()
 
-	start_idx = torch.zeros((1, 1), dtype=torch.long, device=device)
-	generated = model.generate(start_idx, max_new_tokens=cfg.generate_tokens)[0]
+	if args.prompt:
+		fallback_char = " " if " " in stoi else next(iter(stoi))
+		sanitized_prompt = "".join(ch if ch in stoi else fallback_char for ch in args.prompt)
+		start_tokens = encode(sanitized_prompt, stoi)
+		start_idx = start_tokens.unsqueeze(0).to(device)
+	else:
+		start_idx = torch.zeros((1, 1), dtype=torch.long, device=device)
+	generated = model.generate(
+		start_idx,
+		max_new_tokens=cfg.generate_tokens,
+		temperature=args.temperature,
+		top_k=args.top_k,
+	)[0]
 	print("\n--- Generated Text ---")
 	print(decode(generated, itos))
 
